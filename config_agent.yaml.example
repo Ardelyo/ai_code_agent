@@ -1,0 +1,37 @@
+# AI Code Agent Configuration Example
+# Copy this file to config_agent.yaml and edit with your settings
+
+# OpenRouter Configuration
+openrouter:
+  # Get your API key from https://openrouter.ai/keys
+  api_key: "your_openrouter_api_key_here"
+  
+  # Model settings for different tasks
+  # Recommended models, but you can change these
+  model_identifier: "mistralai/mistral-7b-instruct"  # For code identification
+  model_generation: "anthropic/claude-2"  # For code generation
+
+# Ollama Configuration (for local models)
+ollama:
+  base_url: "http://localhost:11434"  # Default Ollama URL
+  
+  # Recommended local models
+  model_identifier: "codellama:13b"  # For code identification
+  model_generation: "codellama:34b"  # For code generation
+
+# Default provider to use (openrouter or ollama)
+default_provider: "openrouter"
+
+# Safety settings
+backup:
+  enabled: true  # Set to false to disable automatic backups
+  max_backups: 5  # Maximum number of backup files to keep
+
+# Behavior settings
+indentation:
+  default_mode: "match_original_block_start"  # or "as_is"
+  
+# Logging settings
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "ai_code_agent.log"  # Log file path
