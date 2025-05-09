@@ -54,7 +54,7 @@ The AI Code Agent is a powerful CLI tool designed to streamline code modificatio
 
 **Created by:**
 - **Ardellio Satria Anindito**
-  - Experience: 6 months
+  - Experience: 4 YEARS, 2 MONTHS
   - Portfolio: [bit.ly/ardelyo](https://bit.ly/ardelyo)
   - Instagram: [@ardel.yo](https://instagram.com/ardel.yo)
   - TikTok: [@ardel.yo](https://tiktok.com/@ardel.yo)
