@@ -1,18 +1,17 @@
 # agent.py
 import argparse
-import json
-import os
-import re
 import sys
-from pathlib import Path
 import yaml # pip install PyYAML
-import tempfile # For temporary markdown file
+from pathlib import Path
+import os
+import json # For LLM action parsing
 
-# --- Import your tools and connectors ---
-import replacer_core 
-from tools import FileSystemTool, LLMTool, CodeAnalysisTool
+# --- Project Imports ---
+import replacer_core
+from tools import FileSystemTool, LLMTool, CodeAnalysisTool, ChangeOrchestratorTool
+from connectors import OpenRouterConnector, OllamaConnector # Assuming these are stable
+from advanced_planner_tools import StateManager, TaskDecomposer, ReActPlannerExecutor, ClarificationModule
 
-# --- Helper Classes and Functions (Config, get_yes_no_input - same as before) ---
 class Config:
     def __init__(self, config_path_str="config_agent.yaml"):
         self.data = {}
@@ -21,23 +20,47 @@ class Config:
             try:
                 with open(config_path, 'r', encoding='utf-8') as f:
                     loaded_yaml = yaml.safe_load(f)
-                    if loaded_yaml: 
+                    if loaded_yaml:
                         self.data = loaded_yaml
                 print(f"INFO: Loaded configuration from {config_path}")
             except yaml.YAMLError as e:
                 print(f"WARNING: Error parsing {config_path}: {e}. Using defaults/CLI args.")
         else:
-            print(f"INFO: Config file {config_path} not found. Using defaults/CLI args.")
+            print(f"INFO: Config file '{config_path}' not found. Using defaults/CLI args.")
 
     def get(self, key, default=None, cli_override=None):
         if cli_override is not None:
             return cli_override
-        env_val = os.getenv(key.upper().replace("-", "_"))
+
+        keys = key.split('.')
+        value_from_yaml = self.data
+        try:
+            for k_part in keys:
+                if isinstance(value_from_yaml, dict):
+                    value_from_yaml = value_from_yaml[k_part]
+                else:
+                    value_from_yaml = None
+                    break
+            if value_from_yaml is not None:
+                if isinstance(default, bool) and isinstance(value_from_yaml, str):
+                    return value_from_yaml.lower() in ['true', '1', 't', 'y', 'yes']
+                if isinstance(default, int) and isinstance(value_from_yaml, (str,float)): # Allow string/float from YAML for int
+                    try: return int(value_from_yaml)
+                    except ValueError: pass # Fall through if not convertible
+                if isinstance(default, float) and isinstance(value_from_yaml, (str,int)): # Allow string/int from YAML for float
+                    try: return float(value_from_yaml)
+                    except ValueError: pass # Fall through
+                return value_from_yaml
+        except (KeyError, TypeError):
+            value_from_yaml = None
+
+        env_key = key.upper().replace(".", "_").replace("-", "_")
+        env_val = os.getenv(env_key)
         if env_val is not None:
+            if isinstance(default, bool): return env_val.lower() in ['true', '1', 't', 'y', 'yes']
+            if isinstance(default, int): return int(env_val)
+            if isinstance(default, float): return float(env_val)
             return env_val
-        yaml_val = self.data.get(key) 
-        if yaml_val is not None:
-            return yaml_val
         return default
 
 def get_yes_no_input(prompt_message: str, default_yes: bool = True) -> bool:
@@ -52,268 +75,258 @@ def get_yes_no_input(prompt_message: str, default_yes: bool = True) -> bool:
         except EOFError: return default_yes
         except KeyboardInterrupt: print("\nInput cancelled."); return False
 
-def simple_ai_planner_and_executor(
-    user_prompt: str, 
-    llm_tool: LLMTool, 
-    fs_tool: FileSystemTool,
-    code_tool: CodeAnalysisTool,
-    default_model_choice: str,
-    dry_run: bool,
-    no_backup: bool
-    ):
-    print(f"\n🤖 AI Agent received prompt: \"{user_prompt}\"")
+def run_advanced_agent(user_prompt: str, config_loader: Config, op_mode_name: str,
+                       project_base_path: Path,
+                       dry_run: bool, no_backup: bool, skip_confirmation: bool):
+    print(f"🤖 AI Agent activated. Operational Mode: {op_mode_name.upper()}")
+    print(f"User Prompt: \"{user_prompt}\"")
+    print(f"Project Base Path: {project_base_path.resolve()}")
 
-    # --- Stage 1: Identify Target File ---
-    target_file_path_str = ""
-    file_match = re.search(r"(?:in|modify|update|refactor|edit|change|process)\s+(?:file\s+)?['\"]?([\w\/\.\-\_]+\.\w+)['\"]?", user_prompt, re.IGNORECASE)
-    if file_match:
-        target_file_path_str = file_match.group(1)
-        print(f"INFO: Tentatively identified target file from prompt: '{target_file_path_str}'")
-    else:
-        target_file_path_str = input("AI> Could not determine target file from prompt. Please enter file path: ").strip()
-        if not target_file_path_str:
-            print("ERROR: Target file path is required. Exiting.")
-            return
+    mode_conf_prefix = f"operational_modes.{op_mode_name}"
 
-    target_file_path = Path(target_file_path_str)
-    original_file_content = "" # Initialize to empty string
-    original_file_lines = []
+    def get_mode_config(specific_key_suffix, general_config_key=None, ultimate_fallback_value=None):
+        mode_specific_value = config_loader.get(f"{mode_conf_prefix}.{specific_key_suffix}", default=ultimate_fallback_value) # Pass fallback to get
+        if mode_specific_value is not None: # Check if get returned non-None
+             # If mode_specific_value is identical to ultimate_fallback_value, it means it wasn't found in mode-specific.
+             # So then try general_config_key.
+            if mode_specific_value == ultimate_fallback_value and general_config_key : # Check if it was truly a fallback
+                general_value = config_loader.get(general_config_key, default=ultimate_fallback_value)
+                return general_value # This will be ultimate_fallback_value if general_config_key also not found
+            return mode_specific_value # Found in mode-specific
 
-    if target_file_path.exists():
-        original_file_content = fs_tool.read_file(str(target_file_path))
-        if original_file_content is None: # fs_tool.read_file now returns None on error
-            print(f"ERROR: Failed to read existing target file '{target_file_path}'. Exiting.")
-            return
-        original_file_lines = original_file_content.splitlines()
-        print(f"INFO: Target file '{target_file_path}' exists and was read.")
-    else:
-        if not get_yes_no_input(f"AI> Target file '{target_file_path}' does not exist. Create it?", default_yes=False):
-            print("INFO: Operation cancelled by user.")
-            return
-        print(f"INFO: Will create new file: '{target_file_path}'")
-        # original_file_content remains "" for new files
+        if general_config_key: # Mode specific was None, try general
+            general_value = config_loader.get(general_config_key, default=ultimate_fallback_value)
+            return general_value
+        
+        return ultimate_fallback_value # Ultimate fallback if all else fails
 
-    # --- Stage 2: Use LLM to generate block_identifier ---
-    print(f"\nAI> Attempting to identify the code block to modify in '{target_file_path_str}'...")
-    file_context_snippet = code_tool.get_file_context_snippet(original_file_content, max_lines=100, max_chars=4000)
-    
-    block_identifier_json = llm_tool.generate_json_block_identifier(
-        user_prompt, 
-        file_context_snippet,
-        default_model_choice 
+    planning_model = get_mode_config("default_planning_model", "DEFAULT_MODEL_CHOICE", "ollama/mistral:7b")
+    generation_model = get_mode_config("default_generation_model", "DEFAULT_MODEL_CHOICE", "ollama/mistral:7b")
+    allow_task_decomposition = get_mode_config("allow_task_decomposition", None, True) # No general key, direct fallback
+    max_api_calls = get_mode_config("max_api_calls_openrouter", None, 10)
+    max_ollama_iterations = get_mode_config("max_planning_iterations_ollama", None, 10)
+    allow_clarification = get_mode_config("allow_clarification_loops", None, True)
+    max_gen_tokens = get_mode_config("max_tokens_generation", None, 2048)
+
+    print(f"INFO: Using Planning Model: {planning_model}")
+    print(f"INFO: Using Generation Model: {generation_model}")
+    print(f"INFO: Task Decomposition: {'Enabled' if allow_task_decomposition else 'Disabled'}")
+    print(f"INFO: Clarification Loops: {'Enabled' if allow_clarification else 'Disabled'}")
+    print(f"INFO: Max OpenRouter API Calls: {max_api_calls}")
+    print(f"INFO: Max Ollama/Sub-task Iterations: {max_ollama_iterations}")
+    print(f"INFO: Max Generation Tokens: {max_gen_tokens}")
+
+
+    state_manager = StateManager(
+        user_prompt=user_prompt,
+        operational_mode=op_mode_name,
+        mode_config={
+            "planning_model": planning_model,
+            "generation_model": generation_model,
+            "max_api_calls_openrouter": int(max_api_calls), # Ensure int
+            "max_planning_iterations_ollama": int(max_ollama_iterations), # Ensure int
+            "allow_clarification_loops": bool(allow_clarification), # Ensure bool
+            "max_tokens_generation": int(max_gen_tokens) # Ensure int
+        },
+        project_base_path=project_base_path,
+        dry_run=dry_run
     )
 
-    if not block_identifier_json:
-        print("ERROR: AI failed to generate a valid block identifier. Cannot proceed.")
-        # Potential future enhancement: call gather_instructions_interactively for block_identifier
-        return
-    
-    print(f"AI> Identified block with: {json.dumps(block_identifier_json, indent=2)}")
-
-    # --- Stage 3: Use LLM to generate replacement code ---
-    original_block_snippet_for_llm = None
-    if original_file_lines and block_identifier_json:
-        temp_find_result = replacer_core.find_target_block(original_file_lines, block_identifier_json, str(target_file_path))
-        if temp_find_result:
-            s_idx, e_idx, _ = temp_find_result
-            if 0 <= s_idx <= e_idx < len(original_file_lines):
-                 original_block_snippet_for_llm = "\n".join(original_file_lines[s_idx : e_idx+1])
-                 print(f"INFO: Extracted original block snippet for LLM context (length {len(original_block_snippet_for_llm)} chars).")
-            else: 
-                if s_idx == e_idx + 1: 
-                    print("INFO: Identified an insertion point, no original block content to replace.")
-                else:
-                    print(f"WARNING: find_target_block returned invalid range [{s_idx}-{e_idx}] for existing file. Proceeding without original block snippet.")
-        else:
-            print("WARNING: Could not find the specified block in the existing file to provide as context for replacement code generation.")
-
-    print(f"\nAI> Generating replacement code based on your prompt...")
-    # This is the full list of lines for the replacement code
-    full_replacement_code_lines = llm_tool.generate_code_snippet(
-        user_request=user_prompt, 
-        original_code_snippet=original_block_snippet_for_llm,
-        surrounding_context=file_context_snippet if not original_block_snippet_for_llm else None, 
-        model_choice=default_model_choice 
-    )
-
-    if not full_replacement_code_lines or \
-       (len(full_replacement_code_lines) == 1 and full_replacement_code_lines[0].startswith("Error:")) or \
-       (len(full_replacement_code_lines) == 0 and not (original_block_snippet_for_llm and "delete" in user_prompt.lower())): # Allow empty if it's a deletion
-        print("ERROR: AI failed to generate replacement code or generated empty code unexpectedly. Cannot proceed.")
-        return
-
-    # --- Stage 3.5: Save full generated code to a temporary markdown file for review ---
-    preview_file_path = None
-    if full_replacement_code_lines: # Only save if there's something to show
-        try:
-            # Determine language for markdown code block (simple heuristic)
-            target_ext = target_file_path.suffix.lower().lstrip('.')
-            lang_hint = target_ext if target_ext in ["py", "js", "html", "css", "java", "cpp", "csharp", "xml", "json", "yaml", "md"] else ""
-
-            # Create a temporary file that will be automatically deleted
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding='utf-8') as tmp_file:
-                tmp_file.write(f"``` {lang_hint}\n")
-                tmp_file.write("\n".join(full_replacement_code_lines))
-                tmp_file.write("\n```")
-                preview_file_path = tmp_file.name
-            print(f"\n✨ AI> Full generated replacement code has been saved for your review to:\n      {preview_file_path}")
-            print("      (This file will be deleted after the script finishes or on error).")
-        except Exception as e:
-            print(f"WARNING: Could not save generated code to a temporary file for review: {e}")
-
-    print("\nAI> Preview of generated replacement code (first 5 lines):")
-    for line in full_replacement_code_lines[:5]:
-        print(f"  {line}")
-    if len(full_replacement_code_lines) > 5: print("  ...")
-
-
-    # --- Stage 4: Construct and Confirm Full Instruction ---
-    instruction = {
-        "target_file": str(target_file_path),
-        "block_identifier": block_identifier_json, # Use the LLM generated one
-        "replacement_code": full_replacement_code_lines, # Use the FULL code here
-        "indentation_handling": "match_original_block_start", 
-        "backup_original_file": not no_backup, 
-        "create_if_not_exists": not target_file_path.exists() 
+    llm_tool_config_data = {
+        "OPENROUTER_API_KEY": config_loader.get("openrouter.api_key"),
+        "OPENROUTER_SITE_URL": config_loader.get("openrouter.site_url"),
+        "OPENROUTER_REFERRER": config_loader.get("openrouter.app_name"),
+        "OLLAMA_BASE_URL": config_loader.get("ollama.base_url", "http://localhost:11434"),
+        "DEFAULT_MODEL_CHOICE": config_loader.get("DEFAULT_MODEL_CHOICE", "ollama/mistral:7b"),
+        "MAX_TOKENS_GENERATION": int(max_gen_tokens)
     }
+    llm_tool = LLMTool(llm_tool_config_data)
+    fs_tool = FileSystemTool(project_base_path=project_base_path)
+    code_analysis_tool = CodeAnalysisTool()
+    change_orchestrator_tool = ChangeOrchestratorTool()
 
-    print("\n--- AI Proposed Action ---")
-    print(f"Target File: {instruction['target_file']}")
-    print(f"Block Identifier Type: {instruction['block_identifier'].get('type')}")
-    # ... (rest of the print summary for block_identifier details) ...
-    if 'name' in instruction['block_identifier']: print(f"Name/Function/Class: {instruction['block_identifier']['name']}")
-    if 'start_marker_regex' in instruction['block_identifier']:
-        print(f"Start Marker Regex: {instruction['block_identifier']['start_marker_regex']}")
-        print(f"End Marker Regex: {instruction['block_identifier']['end_marker_regex']}")
-        print(f"Inclusive Markers: {instruction['block_identifier'].get('inclusive_markers', False)}")
+    task_decomposer = TaskDecomposer(llm_tool, state_manager)
+    clarification_module = ClarificationModule(state_manager)
+    
+    available_tools = {
+        "FileSystemTool": fs_tool,
+        "LLMTool": llm_tool,
+        "CodeAnalysisTool": code_analysis_tool,
+        "ChangeOrchestratorTool": change_orchestrator_tool,
+        "RequestClarificationTool": clarification_module
+    }
+    react_planner = ReActPlannerExecutor(llm_tool, state_manager, available_tools, clarification_module)
 
-    # Preview for instruction also shows first 5 lines
-    print(f"Replacement Code (first 5 lines - see temp file for full code):")
-    for line in instruction['replacement_code'][:5]: print(f"  {line}")
-    if len(instruction['replacement_code']) > 5: print("  ...")
-    
-    proceed = get_yes_no_input("\nAI> Proceed with this action?", default_yes=not dry_run)
-    
-    if not proceed:
-        print("INFO: Operation cancelled by user.")
-        if preview_file_path and os.path.exists(preview_file_path): # Clean up temp file if user cancels
-            try:
-                os.remove(preview_file_path)
-                print(f"INFO: Temporary preview file {preview_file_path} deleted.")
-            except OSError as e:
-                print(f"WARNING: Could not delete temporary preview file {preview_file_path}: {e}")
+    if allow_task_decomposition:
+        print("\n--- Stage 1: Task Decomposition ---")
+        plan = task_decomposer.decompose()
+        if not plan or not plan.get("sub_tasks"):
+            print("INFO: Task decomposition did not yield sub-tasks or failed. Proceeding with original prompt as single task.")
+            plan = {
+                "overall_goal": user_prompt,
+                "sub_tasks": [{"id": "main_task_0", "description": user_prompt, "complexity": "unknown", "status": "pending"}]
+            }
+        state_manager.set_plan(plan)
+    else:
+        print("\n--- Stage 1: Skipping Task Decomposition (as per mode config) ---")
+        plan = {
+            "overall_goal": user_prompt,
+            "sub_tasks": [{"id": "main_task_0", "description": user_prompt, "complexity": "unknown", "status": "pending"}]
+        }
+        state_manager.set_plan(plan)
+
+    print("\n--- Stage 2: Plan Execution ---")
+    all_directive_groups = react_planner.execute_plan()
+
+    if not all_directive_groups:
+        print("INFO: Planner did not produce any change directives after all sub-tasks. Exiting.")
         return
 
-    # --- Stage 5: Execute ---
+    print("\n--- Stage 3: Consolidating All Proposed Changes ---")
+    flat_directives = []
+    if all_directive_groups and isinstance(all_directive_groups, list):
+        for group in all_directive_groups:
+            if group and isinstance(group, list):
+                flat_directives.extend(d for d in group if isinstance(d, dict))
+    
+    if not flat_directives:
+        print("INFO: No valid changes (directives) were proposed by the agent after plan execution.")
+        return
+
+    print("Summary of proposed changes:")
+    for i, directive_group in enumerate(all_directive_groups):
+        if directive_group and isinstance(directive_group, list):
+            # Try to get sub-task description for better summary
+            sub_task_desc = f"Step {i+1}"
+            if state_manager.plan and state_manager.plan.get("sub_tasks") and i < len(state_manager.plan["sub_tasks"]):
+                sub_task_id_ref = state_manager.plan["sub_tasks"][i].get("id")
+                sub_task_desc = f"Sub-task '{state_manager.plan['sub_tasks'][i].get('id', i+1)}': {state_manager.plan['sub_tasks'][i].get('description', 'N/A')[:50]}..."
+
+            print(f"  From {sub_task_desc}:")
+            for directive in directive_group:
+                if isinstance(directive, dict):
+                     print(f"    - File: {directive.get('file_path', 'N/A')}, Type: {directive.get('change_type', 'N/A')}, Code lines: {len(directive.get('code_snippet', []))}")
+
+    preview_content = ["# AI Code Agent Proposed Changes\n"]
+    for i, directive_group in enumerate(all_directive_groups):
+        if directive_group and isinstance(directive_group, list):
+            sub_task_header = f"From Sub-task/Plan Step {i+1}"
+            if state_manager.plan and state_manager.plan.get("sub_tasks") and i < len(state_manager.plan["sub_tasks"]):
+                 sub_task_header = f"From Sub-task '{state_manager.plan['sub_tasks'][i].get('id', i+1)}': {state_manager.plan['sub_tasks'][i].get('description', '')}"
+
+            preview_content.append(f"\n## {sub_task_header}\n")
+            for directive in directive_group:
+                if isinstance(directive, dict):
+                    preview_content.append(f"### File: {directive.get('file_path')}\n")
+                    preview_content.append(f"Change Type: {directive.get('change_type')}\n")
+                    if directive.get('target_element_selector'):
+                         preview_content.append(f"Target Selector: {directive.get('target_element_selector')}\n")
+                    if directive.get('block_identifier'): # block_identifier could be None
+                         preview_content.append(f"Target Block Identifier: {json.dumps(directive.get('block_identifier'))}\n")
+                    
+                    code_snippet_preview = directive.get('code_snippet', [])
+                    # Ensure code_snippet_preview is a list of strings
+                    if not isinstance(code_snippet_preview, list):
+                        code_snippet_preview = str(code_snippet_preview).splitlines()
+                    code_snippet_str = "\n".join(code_snippet_preview)
+
+                    preview_content.append("```\n" + code_snippet_str + "\n```\n")
+    
+    preview_file_path = Path("ai_agent_preview.md")
     try:
-        if not no_backup and instruction.get('backup_original_file') and target_file_path.exists() and not dry_run:
-            replacer_core.backup_file(target_file_path)
+        preview_file_path.write_text("\n".join(preview_content), encoding='utf-8')
+        print(f"\n✨ Detailed preview of all changes saved to: {preview_file_path.resolve()}")
+    except Exception as e:
+        print(f"WARNING: Could not write preview file: {e}")
 
-        if not original_file_lines and not target_file_path.exists() and instruction.get('create_if_not_exists'):
-            final_content_lines = replacer_core.apply_indentation(
-                instruction['replacement_code'], 
-                "", 
-                instruction['indentation_handling']
-            )
-            print(f"INFO: Preparing to create new file '{target_file_path}' with generated content.")
-        else:
-            final_content_lines = replacer_core.perform_replacement_on_content(
-                original_lines=original_file_lines,
-                block_identifier=instruction['block_identifier'],
-                replacement_code=instruction['replacement_code'], # Pass FULL code
-                indentation_handling=instruction['indentation_handling'],
-                target_file_path_str=str(target_file_path)
-            )
-
-        if final_content_lines is None:
-            print(f"ERROR: Failed to determine final content for '{target_file_path}'. Block might not have been found.")
-            return
-
-        modified_file_content = "\n".join(final_content_lines) + "\n"
-
+    if skip_confirmation or get_yes_no_input("\nAI> Proceed with applying these changes?", default_yes=not dry_run):
         if dry_run:
-            print(f"\n--- Dry Run: Proposed changes for {target_file_path.name} ---")
-            replacer_core.show_diff(original_file_content, modified_file_content, target_file_path.name)
-            print("--- End Dry Run ---")
+            print("\n--- Dry Run Mode: Simulating application of changes. ---")
+            # In dry run, ChangeOrchestratorTool will show diffs but not write
+            change_orchestrator_tool.apply_all_changes(
+                all_directive_groups, fs_tool, replacer_core, state_manager, no_backup
+            )
+            print("--- Dry Run Complete. No files modified. ---")
         else:
-            success = fs_tool.write_to_file(str(target_file_path), final_content_lines, create_dirs=True)
-            if success:
-                print(f"✅ AI Agent successfully modified '{target_file_path}'.")
+            print("\n--- Stage 4: Applying Changes ---")
+            final_success = change_orchestrator_tool.apply_all_changes(
+                all_directive_groups, fs_tool, replacer_core, state_manager, no_backup
+            )
+            if final_success:
+                print("✅ AI Agent successfully applied all changes.")
             else:
-                print(f"❌ AI Agent failed to write modifications to '{target_file_path}'.")
-    finally: # Ensure temp file is deleted whether successful or not (if user proceeded)
-        if preview_file_path and os.path.exists(preview_file_path):
-            try:
-                os.remove(preview_file_path)
-                print(f"INFO: Temporary preview file {preview_file_path} deleted.")
-            except OSError as e:
-                print(f"WARNING: Could not delete temporary preview file {preview_file_path}: {e}")
+                print("❌ AI Agent encountered errors during change application. Some changes might be partial. Please review.")
+    else:
+        print("INFO: Operation cancelled by user. No changes applied.")
+    print("\n🤖 AI Agent run complete.")
 
-
-# --- Main Function (defined after helpers) ---
 def main():
-    parser = argparse.ArgumentParser(description="AI-Powered Code Agent to modify files based on natural language.")
-    # ... (argparse setup remains the same as before) ...
+    parser = argparse.ArgumentParser(description="Advanced AI-Powered Code Agent.")
     parser.add_argument("user_prompt", help="Natural language instruction for the code modification.")
-    parser.add_argument("--model", help="LLM model choice (e.g., 'openrouter/model-id', 'ollama/model-name'). Overrides config.", default=None)
+    parser.add_argument("--project-path", "-p", help="Absolute or relative path to the project's root directory.", default=None)
     parser.add_argument("--config", help="Path to YAML configuration file.", default="config_agent.yaml")
-    
-    parser.add_argument("--openrouter-api-key", help="OpenRouter API Key. Overrides config/env.", default=None)
-    parser.add_argument("--openrouter-site-url", help="OpenRouter Site URL for referrer. Overrides config/env.", default=None)
-    parser.add_argument("--openrouter-app-name", help="OpenRouter App Name for referrer. Overrides config/env.", default=None)
-    parser.add_argument("--ollama-base-url", help="Ollama base URL (e.g., http://localhost:11434). Overrides config/env.", default=None)
-    parser.add_argument("--ollama-default-model", help="Default Ollama model if 'ollama/' is used without specific model. Overrides config/env.", default=None)
-
+    parser.add_argument("--mode", help="Operational mode (efficient, normal, max_energy). Overrides config default.", default=None)
     parser.add_argument("--dry-run", action="store_true", help="Show changes without writing to file.")
-    parser.add_argument("--no-backup", action="store_true", help="Do not create backup of the target file.")
-    
+    parser.add_argument("--no-backup", action="store_true", help="Do not create backups of target files.")
+    parser.add_argument("--yes", action="store_true", help="Auto-confirm prompts (use with caution!).")
+    parser.add_argument("--planning-model", help="Override planning model for current run.", default=None)
+    parser.add_argument("--generation-model", help="Override generation model for current run.", default=None)
+
     args = parser.parse_args()
-    config_loader = Config(args.config) 
+    config_loader = Config(args.config)
 
-    cfg_data_for_tools = {
-        "OPENROUTER_API_KEY": config_loader.get("OPENROUTER_API_KEY", cli_override=args.openrouter_api_key),
-        "OPENROUTER_SITE_URL": config_loader.get("OPENROUTER_SITE_URL", cli_override=args.openrouter_site_url),
-        "OPENROUTER_REFERRER": config_loader.get("OPENROUTER_REFERRER", cli_override=args.openrouter_app_name),
-        "OLLAMA_BASE_URL": config_loader.get("OLLAMA_BASE_URL", default="http://localhost:11434", cli_override=args.ollama_base_url),
-        "OLLAMA_DEFAULT_MODEL": config_loader.get("OLLAMA_DEFAULT_MODEL", cli_override=args.ollama_default_model),
-        "DEFAULT_MODEL_CHOICE": config_loader.get("DEFAULT_MODEL_CHOICE", cli_override=args.model)
-    }
+    project_path_str = args.project_path
+    if not project_path_str:
+        print("INFO: Project path not specified via --project-path argument.")
+        while True:
+            try:
+                raw_path_input = input("Please enter the path to your project's root directory (or leave blank for current dir): ")
+                raw_path = raw_path_input.strip().strip('"').strip("'")
+                if not raw_path:
+                    project_path_str = "."
+                    print(f"INFO: Using current directory as project root: {Path('.').resolve()}")
+                    break
+                potential_path = Path(raw_path)
+                if potential_path.exists() and potential_path.is_dir():
+                    project_path_str = raw_path
+                    print(f"INFO: Using project root: {potential_path.resolve()}")
+                    break
+                else:
+                    print(f"ERROR: Path '{raw_path_input}' (processed as '{raw_path}') does not exist or is not a directory. Please try again.")
+            except KeyboardInterrupt: print("\nOperation cancelled by user."); sys.exit(130)
+            except Exception as e: print(f"An error occurred: {e}")
     
-    # ... (rest of main function, LLM config checks, tool initializations - remains the same) ...
-    if not cfg_data_for_tools.get("DEFAULT_MODEL_CHOICE"):
-        print("ERROR: No default model specified. Use --model or set DEFAULT_MODEL_CHOICE in config/env.")
-        sys.exit(1)
-    if cfg_data_for_tools["DEFAULT_MODEL_CHOICE"].startswith("openrouter/") and not cfg_data_for_tools.get("OPENROUTER_API_KEY"):
-        print("ERROR: OpenRouter model selected, but OPENROUTER_API_KEY is not set in config, CLI, or environment.")
+    project_base_path = Path(project_path_str).resolve()
+    if not project_base_path.is_dir():
+        print(f"FATAL ERROR: Resolved project path '{project_base_path}' is not a valid directory. Exiting.")
         sys.exit(1)
 
-    llm_tool = LLMTool(cfg_data_for_tools)
-    fs_tool = FileSystemTool()
-    code_tool = CodeAnalysisTool()
+    op_mode_name = args.mode if args.mode else config_loader.get("DEFAULT_OPERATIONAL_MODE", "normal")
+    
+    # Apply CLI model overrides to the config_loader.data before passing to run_advanced_agent
+    if args.planning_model:
+        modes_data = config_loader.data.setdefault('operational_modes', {})
+        mode_settings = modes_data.setdefault(op_mode_name, {})
+        mode_settings['default_planning_model'] = args.planning_model
+        print(f"INFO: Overriding planning model for '{op_mode_name}' mode with: {args.planning_model}")
+    if args.generation_model:
+        modes_data = config_loader.data.setdefault('operational_modes', {})
+        mode_settings = modes_data.setdefault(op_mode_name, {})
+        mode_settings['default_generation_model'] = args.generation_model
+        print(f"INFO: Overriding generation model for '{op_mode_name}' mode with: {args.generation_model}")
+
 
     try:
-        simple_ai_planner_and_executor(
-            args.user_prompt,
-            llm_tool,
-            fs_tool,
-            code_tool,
-            cfg_data_for_tools["DEFAULT_MODEL_CHOICE"],
-            args.dry_run,
-            args.no_backup
+        run_advanced_agent(
+            args.user_prompt, config_loader, op_mode_name, project_base_path,
+            args.dry_run, args.no_backup, args.yes
         )
-    except KeyboardInterrupt:
-        print("\n🤖 Agent operation cancelled by user (Ctrl+C).")
-        # Attempt to clean up temp file if one was created and path is known
-        # This is tricky because preview_file_path is local to simple_ai_planner_and_executor
-        # A more robust solution would involve passing its state or using a context manager.
-        # For now, we'll rely on the finally block within simple_ai_planner_and_executor.
-        sys.exit(130)
+    except KeyboardInterrupt: print("\n🤖 Agent operation cancelled by user (Ctrl+C)."); sys.exit(130)
     except Exception as e:
         print(f"FATAL ERROR in agent execution: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
 
-# --- Entry Point ---
 if __name__ == "__main__":
     main()
